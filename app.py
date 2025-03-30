@@ -2,12 +2,15 @@ import streamlit as st
 import google.generativeai as genai
 import time
 from datetime import datetime
+from dateutil.parser import parse
+from dateutil.relativedelta import relativedelta
 from tavily import TavilyClient
 from streamlit_extras.let_it_rain import rain
 import os
 from dotenv import load_dotenv
 
 # --- Environment Setup ---
+load_dotenv()
 load_dotenv()  # Load environment variables from .env file
 
 # --- API Configuration with Error Handling ---
@@ -32,7 +35,37 @@ def type_message(text):
         time.sleep(0.02)
     return message
 
-# --- Core Functions ---
+# --- Improved Date Parsing ---
+def parse_flexible_date(date_str):
+    try:
+        if "summer" in date_str.lower():
+            year = datetime.now().year
+            if "next" in date_str.lower():
+                year += 1
+            return f"06/15-08/31/{year}"
+        elif "winter" in date_str.lower():
+            year = datetime.now().year
+            if "next" in date_str.lower():
+                year += 1
+            return f"12/01-02/28/{year}"
+        elif "week" in date_str.lower():
+            parts = date_str.split()
+            if len(parts) >= 3:
+                duration = int(parts[1])
+                month = parts[3]
+                start_date = parse(f"1 {month}").replace(day=1)
+                end_date = start_date + relativedelta(days=duration*7)
+                return f"{start_date.strftime('%m/%d')}-{end_date.strftime('%m/%d')}"
+        elif "-" in date_str or "to" in date_str:
+            return date_str.replace("to", "-")
+        else:
+            parsed = parse(date_str, fuzzy=True)
+            return parsed.strftime("%m/%d/%Y")
+    except Exception as e:
+        print(f"Date parsing error: {e}")
+        return None
+
+# --- Core Functions with Enhanced Error Handling ---
 def is_greeting(text):
     text = text.lower().strip()
     greetings = ["hi", "hello", "hey", "hii", "hola", "greetings"]
@@ -53,7 +86,8 @@ def extract_info(text, info_type):
         "budget": "Extract budget information from this text. Return as 'low/medium/high' or empty string:",
         "preferences": "Extract travel preferences from this text focusing on activities, interests, and style:",
         "food_preferences": "Extract food preferences from this text (vegetarian/vegan/gluten-free/etc.):",
-        "special_needs": "Extract special requirements from this text (wheelchair accessible/family-friendly/etc.):"
+        "special_needs": "Extract special requirements from this text (wheelchair accessible/family-friendly/etc.):",
+        "accommodation": "Extract accommodation preferences from this text (hotel/hostel/villa/airbnb/luxury/budget/etc.):"
     }
     try:
         response = model.generate_content(f"{prompts[info_type]} '{text}'")
@@ -75,6 +109,14 @@ def find_attractions(destination, preferences="", budget="", hidden_gems=False, 
             query = " ".join(filter(None, query_parts))
             
             results = tavily.search(query=query, include_answer=True, max_results=5)
+            
+            if not results or 'results' not in results or len(results['results']) == 0:
+                st.warning("Couldn't find attractions matching your criteria. Trying a broader search...")
+                # Fallback search without preferences
+                results = tavily.search(query=f"things to do in {destination}", include_answer=True, max_results=5)
+                if not results or 'results' not in results:
+                    return []
+            
             return [{
                 'name': r.get('title', 'Unknown'),
                 'url': r.get('url', '#'),
@@ -84,13 +126,55 @@ def find_attractions(destination, preferences="", budget="", hidden_gems=False, 
         st.error(f"Search error: {str(e)}")
         return []
 
-def generate_itinerary(destination, days, preferences, attractions, budget, start_date, food_type=""):
+def find_accommodations(destination, budget="", accommodation_type=""):
+    try:
+        with st.spinner(f"🏨 Finding {accommodation_type} accommodations in {destination}..."):
+            query_parts = [
+                f"{accommodation_type} accommodations in {destination}",
+                f"{budget} budget" if budget else "",
+                "official sites"
+            ]
+            query = " ".join(filter(None, query_parts))
+            
+            results = tavily.search(query=query, include_answer=True, max_results=3)
+            
+            if not results or 'results' not in results or len(results['results']) == 0:
+                st.warning("Couldn't find accommodations matching your criteria. Trying a broader search...")
+                results = tavily.search(query=f"hotels in {destination}", include_answer=True, max_results=3)
+                if not results or 'results' not in results:
+                    return []
+            
+            return [{
+                'name': r.get('title', 'Unknown'),
+                'url': r.get('url', '#'),
+                'snippet': (r.get('content', '')[:150] + '...') if r.get('content') else 'No description available',
+                'type': accommodation_type if accommodation_type else 'hotel'
+            } for r in results.get('results', [])]
+    except Exception as e:
+        st.error(f"Accommodation search error: {str(e)}")
+        return []
+
+def generate_itinerary(destination, days, preferences, attractions, budget, start_date, food_type="", accommodations=[]):
+    transport_modes = {
+        "low": "public transport and walking",
+        "medium": "taxis and occasional public transport",
+        "high": "private transfers and premium transportation"
+    }
+    
     food_context = f"\n- Dietary preferences: {food_type}" if food_type and food_type != "no restrictions" else ""
+    accommodation_context = ""
+    
+    if accommodations:
+        accommodation_context = "\n- Recommended accommodations:\n"
+        for acc in accommodations[:2]:  # Show top 2 options
+            accommodation_context += f"  - [{acc['name']}]({acc['url']}) ({acc['type']})\n"
     
     prompt = f"""Create a detailed {days}-day itinerary for {destination} starting on {start_date} with:
     - Budget level: {budget}
     - Focus: {preferences}
     {food_context}
+    {accommodation_context}
+    - Transportation: {transport_modes.get(budget, "mix of transport options")}
     - Must include these attractions: {[a['name'] for a in attractions]}
     
     Format with this structure for each day:
@@ -109,9 +193,11 @@ def generate_itinerary(destination, days, preferences, attractions, budget, star
     
     Include:
     - Estimated costs for key activities
-    - Transportation tips between locations
+    - Transportation tips between locations (specific routes/modes)
+    - Travel times between locations
     - Links to official websites when available
-    - Specific notes about dietary options at each food venue"""
+    - Specific notes about dietary options at each food venue
+    - Recommended accommodations nearby if not already provided"""
     
     try:
         response = model.generate_content(prompt)
@@ -119,7 +205,7 @@ def generate_itinerary(destination, days, preferences, attractions, budget, star
     except Exception as e:
         return f"Sorry, I couldn't generate the itinerary. Error: {str(e)}"
 
-# --- Conversation Handler ---
+# --- Enhanced Conversation Handler ---
 def handle_conversation():
     last_msg = st.session_state.messages[-1]["content"].strip().lower()
     
@@ -144,9 +230,13 @@ def handle_conversation():
     if "dates" not in st.session_state:
         dates = extract_info(last_msg, "dates")
         if dates:
-            st.session_state.dates = dates
-            st.session_state.start_date = dates.split('-')[0] if '-' in dates else dates
-            return "What's your budget range? (low/medium/high)"
+            parsed_date = parse_flexible_date(dates)
+            if parsed_date:
+                st.session_state.dates = parsed_date
+                st.session_state.start_date = parsed_date.split('-')[0] if '-' in parsed_date else parsed_date
+                return "What's your budget range? (low/medium/high)"
+            else:
+                return "I couldn't understand those dates. Please try again (Example: 'next summer' or 'August 10-17')"
         return "When will you be visiting? (Example: 'next month' or 'August 10-17')"
 
     # Get budget
@@ -174,6 +264,11 @@ def handle_conversation():
     # Get food preferences
     if "food_type" not in st.session_state:
         st.session_state.food_type = last_msg if last_msg != "no preferences" else "no restrictions"
+        return "What type of accommodation do you prefer? (Examples: 'hotel', 'hostel', 'airbnb', 'luxury resort')"
+
+    # Get accommodation preferences
+    if "accommodation_type" not in st.session_state:
+        st.session_state.accommodation_type = last_msg if last_msg != "no preference" else "any"
         return "Any special requirements? (Examples: 'wheelchair accessible', 'family-friendly', or 'none')"
 
     # Get special needs
@@ -182,12 +277,22 @@ def handle_conversation():
         st.session_state.preferences = (
             f"Activities: {st.session_state.activities}\n"
             f"Food: {st.session_state.food_type}\n"
+            f"Accommodation: {st.session_state.accommodation_type}\n"
             f"Special needs: {st.session_state.special_needs}"
         )
+        
+        # Find accommodations first
+        st.session_state.accommodations = find_accommodations(
+            st.session_state.destination,
+            st.session_state.budget,
+            st.session_state.accommodation_type
+        )
+        
         return (
             f"Perfect! For your {st.session_state.days}-day trip to {st.session_state.destination} with a {st.session_state.budget} budget:\n"
             f"- Activities: {st.session_state.activities}\n"
             f"- Food: {st.session_state.food_type}\n"
+            f"- Accommodation: {st.session_state.accommodation_type}\n"
             f"- Special needs: {st.session_state.special_needs}\n\n"
             "Should I focus on:\n"
             "1. Popular tourist spots\n"
@@ -219,6 +324,12 @@ def handle_conversation():
             reply = "Here's what I found:\n"
             for i, a in enumerate(st.session_state.attractions[:3], 1):
                 reply += f"\n{i}. [{a['name']}]({a['url']}) - {a['snippet']}"
+            
+            if st.session_state.accommodations:
+                reply += "\n\nRecommended accommodations:\n"
+                for i, a in enumerate(st.session_state.accommodations[:2], 1):
+                    reply += f"\n{i}. [{a['name']}]({a['url']}) - {a['snippet']}"
+            
             reply += "\n\nReady to create your itinerary? (yes/no)"
             return reply
         return "Please choose 1, 2, or 3 for attraction style"
@@ -232,7 +343,8 @@ def handle_conversation():
             st.session_state.attractions,
             st.session_state.budget,
             st.session_state.get("start_date", "your dates"),
-            st.session_state.food_type
+            st.session_state.food_type,
+            st.session_state.accommodations
         )
         add_confetti()
         st.session_state.itinerary_generated = True
@@ -288,28 +400,6 @@ def main():
     st.set_page_config(page_title="🌍 Travel Planner Pro", page_icon="✈️", layout="wide")
     st.title("✈️ Your Personal Travel Assistant")
     
-    # Add documentation section
-    with st.expander("ℹ️ How this works"):
-        st.markdown("""
-        **Travel Planner Guide**
-        
-        I'll help create your perfect itinerary by asking about:
-        
-        - 🏝️ **Destination** & dates
-        - 💰 **Budget** range (low/medium/high)
-        - ⏳ **Trip duration**
-        - 🎯 **Your interests** (museums, hiking, etc.)
-        - 🍽️ **Food preferences**
-        - ♿ **Special needs**
-        
-        Then I'll research and build your personalized plan!
-        
-        **Tips:**
-        - You can say "start over" at any time
-        - Type "help" if you get stuck
-        - Be as specific or vague as you like - I'll ask for clarification if needed
-        """)
-    
     # Initialize chat
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "assistant", "content": "Hi! I'm your travel assistant. Where would you like to go?"}]
@@ -321,16 +411,9 @@ def main():
     
     # Handle input
     if prompt := st.chat_input("Type your message here..."):
-        # Check for special commands
         if prompt.lower() == "help":
             st.session_state.messages.append({"role": "user", "content": prompt})
-            help_text = """
-            **Help Menu**
-            - To start over, say "start over"
-            - To change something, say "change [thing]" (like "change budget")
-            - To save your itinerary, choose option 1 after generation
-            - Need more help? Just describe what you're trying to do!
-            """
+            help_text = """**Help Menu**\n- To start over, say "start over"\n- To change something, say "change [thing]"\n- Need more help? Just describe what you're trying to do!"""
             st.session_state.messages.append({"role": "assistant", "content": help_text})
             return
         
@@ -346,7 +429,7 @@ def main():
             thinking.markdown("✈️ Planning...")
             
             response = handle_conversation()
-            if response:  # Only append if there's a response
+            if response:
                 message = type_message(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
             
