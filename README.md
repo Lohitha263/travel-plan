@@ -19,7 +19,7 @@ tavily-python==0.0.5
 python-dateutil==2.9.0
 streamlit-extras==0.3.0
 python-dotenv==1.0.1
-#Ai Prompts
+##Ai Prompts
 prompts = {
     "destination": "Extract ONLY the travel destination. Return JUST location name:",
     "dates": "Extract dates as 'MM/DD-MM/DD' or 'X days':",
